@@ -56,14 +56,18 @@ def _earlier(a, b):
 
 # ── Parser Open Order ─────────────────────────────────────────────────────────
 def parse_open_order(file_bytes):
-    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
-        try:
-            content = file_bytes.decode(enc)
-            break
-        except (UnicodeDecodeError, LookupError):
-            continue
+    # Detect UTF-16 by BOM (FF FE = LE, FE FF = BE) — other encodings never start with 0xFF
+    if file_bytes[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        content = file_bytes.decode("utf-16")
     else:
-        content = file_bytes.decode("latin-1", errors="replace")
+        for enc in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                content = file_bytes.decode(enc)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        else:
+            content = file_bytes.decode("latin-1", errors="replace")
     soup = BeautifulSoup(content, "lxml")
     pedidos = set()
     idx_ref_sku = {}

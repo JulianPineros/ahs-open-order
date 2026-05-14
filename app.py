@@ -1,6 +1,5 @@
 import streamlit as st
 import io
-import re
 import datetime
 
 st.set_page_config(page_title="AHS ↔ Odoo | Fechas de carga", page_icon="📦", layout="centered")
@@ -54,9 +53,12 @@ def _earlier(a, b):
         return a if da <= db else b
     return a or b
 
-# ── Parser Open Order ─────────────────────────────────────────────────────────
+# ── Parser Open Order (formato tabla plana Ashley) ────────────────────────────
+# Columnas del archivo:
+#   [0] Tienda  [1] Ref. proveedor  [2] N° Pedido  [3] Fecha pedido
+#   [4] Fecha solicitud  [5] Fecha carga est.  [6] Monto  [7] Moneda
+#   [8] Unit price  [9] Volumen m³  [10] Qty  [11] Modo
 def parse_open_order(file_bytes):
-    # Detect UTF-16 by BOM (FF FE = LE, FE FF = BE) — other encodings never start with 0xFF
     if file_bytes[:2] in (b'\xff\xfe', b'\xfe\xff'):
         content = file_bytes.decode("utf-16")
     else:
@@ -68,47 +70,34 @@ def parse_open_order(file_bytes):
                 continue
         else:
             content = file_bytes.decode("latin-1", errors="replace")
+
     soup = BeautifulSoup(content, "lxml")
-    pedidos = set()
-    idx_ref_sku = {}
-    idx_sku     = {}
-    current_order = {}
+    table = soup.find("table")
+    if not table:
+        return set(), {}
 
-    for table in soup.find_all("table"):
-        cells_per_row = [
-            [td.get_text(strip=True) for td in row.find_all("td")]
-            for row in table.find_all("tr")
-        ]
-        flat = " | ".join(c for row in cells_per_row for c in row)
+    idx_ref = {}  # ref → fecha_carga más temprana (DD/MM/YYYY)
 
-        if "N.º de tienda:" in flat and "N.º de pedido:" in flat and "Artículo n.º" not in flat:
-            m = re.search(r"N\.º de pedido:\s*\|\s*(\S+)", flat)
-            current_order = {"order": m.group(1) if m else ""}
-            if current_order["order"]:
-                pedidos.add(current_order["order"])
+    for row in table.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in row.find_all("td")]
+        if len(cells) < 6:
+            continue
+        ref   = cells[1].strip()
+        fecha = _mdy_to_dmy(cells[5].strip())
+        if not ref or not fecha:
+            continue
+        idx_ref[ref] = _earlier(idx_ref[ref], fecha) if ref in idx_ref else fecha
 
-        elif "Artículo n.º" in flat and current_order:
-            for rc in cells_per_row:
-                if not rc or any("Artículo n.º" in c for c in rc) or "TOTAL" in (rc[0] if rc else ""):
-                    continue
-                if len(rc) >= 15 and len(rc[2]) == 1 and rc[2].isalpha():
-                    sku    = rc[1].strip()
-                    fecha  = _mdy_to_dmy(rc[14].strip())
-                    pedido = current_order.get("order", "")
-                    key    = (pedido, sku)
-                    idx_ref_sku[key] = _earlier(idx_ref_sku[key], fecha) if key in idx_ref_sku else fecha
-                    idx_sku[sku]     = _earlier(idx_sku[sku], fecha)     if sku in idx_sku     else fecha
+    pedidos = set(idx_ref.keys())
+    return pedidos, idx_ref
 
-    return pedidos, idx_ref_sku, idx_sku
-
-# ── Parser Trasladar ──────────────────────────────────────────────────────────
+# ── Parser Trasladar (Odoo stock.picking) ────────────────────────────────────
 def parse_trasladar(file_bytes):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
     ws = wb.active
     headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
     rows = []
-    last_ref  = ""
-    ref_known = False
+    last_ref = ""
 
     for r in range(2, ws.max_row + 1):
         id_col  = ws.cell(r, 1).value
@@ -117,24 +106,18 @@ def parse_trasladar(file_bytes):
         vals    = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
 
         if id_col and str(id_col).strip():
-            if ref_col and str(ref_col).strip():
-                last_ref  = str(ref_col).strip()
-                ref_known = True
-            else:
-                last_ref  = ""
-                ref_known = False
+            last_ref = str(ref_col).strip() if ref_col and str(ref_col).strip() else ""
 
         rows.append({
             "vals":        vals,
             "_ref_filled": last_ref,
-            "_ref_known":  ref_known,
             "_sku":        str(sku).strip() if sku else "",
         })
 
     return headers, rows
 
 # ── Generar Excel ─────────────────────────────────────────────────────────────
-def generate_excel(headers, rows, idx_ref_sku, idx_sku):
+def generate_excel(headers, rows, idx_ref):
     HEADER_FILL = "1F4E79"
     HEADER_NEW  = "2E75B6"
     MATCH_FILL  = ("E2EFDA", "EBF5E1")
@@ -165,26 +148,12 @@ def generate_excel(headers, rows, idx_ref_sku, idx_sku):
 
     for i, row in enumerate(rows):
         r_idx = i + 2
-        vals      = row["vals"]
-        ref       = row["_ref_filled"]
-        ref_known = row["_ref_known"]
-        sku       = row["_sku"]
+        vals  = row["vals"]
+        ref   = row["_ref_filled"]
 
-        fecha_carga = ""
+        fecha_carga = idx_ref.get(ref, "") if ref else ""
         fecha_llega = ""
-        match_type  = "transit"
-
-        if ref and sku:
-            result = idx_ref_sku.get((ref, sku))
-            if result:
-                fecha_carga = result
-                match_type  = "exact"
-
-        if not fecha_carga and not ref_known and sku:
-            result = idx_sku.get(sku)
-            if result:
-                fecha_carga = result
-                match_type  = "exact"
+        match_type  = "exact" if fecha_carga else "transit"
 
         if fecha_carga:
             d = _parse_dmy(fecha_carga)
@@ -237,19 +206,19 @@ if oo_file and tr_file:
                 oo_bytes = oo_file.read()
                 tr_bytes = tr_file.read()
 
-                pedidos, idx_ref_sku, idx_sku = parse_open_order(oo_bytes)
+                pedidos, idx_ref = parse_open_order(oo_bytes)
                 headers, rows_all = parse_trasladar(tr_bytes)
 
                 rows = [r for r in rows_all if r["_ref_filled"] in pedidos]
 
                 ts          = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 output_name = f"Odoo_FechasAshley_{ts}.xlsx"
-                excel_bytes, stats = generate_excel(headers, rows, idx_ref_sku, idx_sku)
+                excel_bytes, stats = generate_excel(headers, rows, idx_ref)
 
                 st.success("✅ Proceso completado")
 
                 m1, m2, m3 = st.columns(3)
-                m1.metric("Pedidos (backlog)", len(pedidos))
+                m1.metric("Referencias Ashley", len(pedidos))
                 m2.metric("Filas procesadas", len(rows))
                 m3.metric("Fechas asignadas", stats["exact"])
 

@@ -2,8 +2,6 @@ import streamlit as st
 import io
 import re
 import datetime
-import tempfile
-import os
 
 st.set_page_config(page_title="AHS ↔ Odoo | Fechas de carga", page_icon="📦", layout="centered")
 
@@ -58,7 +56,14 @@ def _earlier(a, b):
 
 # ── Parser Open Order ─────────────────────────────────────────────────────────
 def parse_open_order(file_bytes):
-    content = file_bytes.decode("utf-8")
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            content = file_bytes.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    else:
+        content = file_bytes.decode("latin-1", errors="replace")
     soup = BeautifulSoup(content, "lxml")
     pedidos = set()
     idx_ref_sku = {}
